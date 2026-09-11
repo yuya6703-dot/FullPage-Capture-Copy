@@ -18,8 +18,12 @@
 /** メッセージ仕様のバージョン。Service Worker と一致しなければ作り直される */
 const PROTOCOL_VERSION = 2;
 
-/** Chrome の 2D Canvas の1辺の上限 */
-const MAX_CANVAS_DIMENSION = 16384;
+/**
+ * Canvas の1辺の上限。Chrome 自体は 65535 まで許すが、PNG を受け取る側の
+ * アプリの互換性を考えて 32767（Firefox と同じ値）で止める。
+ * 縦長の会話を撮るときは主にこの値が効く（16384 だと横幅が数百px まで縮んでしまう）。
+ */
+const MAX_CANVAS_DIMENSION = 32767;
 
 /**
  * Canvas の総面積の上限（ピクセル数）。

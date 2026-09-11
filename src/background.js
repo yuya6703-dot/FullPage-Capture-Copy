@@ -95,7 +95,8 @@ chrome.action.onClicked.addListener((tab) => {
   }
 
   activeCaptureTabId = tab.id;
-  captureAndCopy(tab)
+  setTitle(tab.id, chrome.runtime.getManifest().action.default_title); // 前回のエラー表示を消す
+  withKeepAlive(() => captureAndCopy(tab))
     .catch((err) => {
       console.error('[FullPage Capture & Copy]', err);
       return reportFailure(tab.id, err);
@@ -136,7 +137,7 @@ async function captureAndCopy(tab) {
 
     const copyResult = await transferImageToTab(tab.id, image.chunkCount);
 
-    // deferred = フォーカスが無く「クリック待ち」に切り替わったケース。
+    // deferred = 「クリック待ち」または「ファイル保存」に切り替わったケース。
     // その場合の案内トーストは Content Script 側が既に出しているので何もしない。
     if (!copyResult || !copyResult.deferred) {
       notify(tab.id, buildSuccessMessage(image, capture), 'success');
@@ -149,9 +150,12 @@ async function captureAndCopy(tab) {
 
 function buildSuccessMessage(image, capture) {
   const notes = [];
-  if (image.downscaled) notes.push('上限のため縮小: ' + image.width + '×' + image.height);
+  if (image.downscaled) notes.push('上限のため縮小');
   if (capture.truncated) notes.push('末尾まで撮影できませんでした');
-  return notes.length ? 'コピーしました（' + notes.join(' / ') + '）' : 'コピーしました';
+  const size = image.width + '×' + image.height + 'px';
+  return notes.length
+    ? 'コピーしました ' + size + '（' + notes.join(' / ') + '）'
+    : 'コピーしました ' + size;
 }
 
 /* ==========================================================================
@@ -391,6 +395,8 @@ function assertValidMetrics(metrics) {
  */
 async function reportFailure(tabId, err) {
   const message = errorMessage(err);
+  // トーストは消えるので、アイコンのツールチップには次回実行まで残す
+  setTitle(tabId, '前回の失敗: ' + message);
   try {
     await chrome.tabs.sendMessage(tabId, {
       action: MSG.SHOW_TOAST,
@@ -399,11 +405,23 @@ async function reportFailure(tabId, err) {
     });
   } catch (_) {
     setBadge(tabId, '!', '#dc2626');
-    setTitle(tabId, '失敗: ' + message);
-    setTimeout(() => {
-      setBadge(tabId, '');
-      setTitle(tabId, chrome.runtime.getManifest().action.default_title);
-    }, 6000);
+    setTimeout(() => setBadge(tabId, ''), 8000);
+  }
+}
+
+/**
+ * MV3 の Service Worker は 30 秒間 API 呼び出しが無いと終了する。
+ * PNG エンコードなど長い待ちの間に落ちると何も表示されずに終わるため、
+ * 処理中は定期的に軽い API を叩いて生存を伝える。
+ */
+async function withKeepAlive(task) {
+  const timer = setInterval(() => {
+    chrome.runtime.getPlatformInfo().catch(() => {});
+  }, 20000);
+  try {
+    return await task();
+  } finally {
+    clearInterval(timer);
   }
 }
 

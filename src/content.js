@@ -506,8 +506,14 @@
       await writeImageToClipboard(blob);
       return { ok: true, deferred: false };
     } catch (err) {
-      armClickToCopy(blob);
-      return { ok: true, deferred: true, reason: errorMessage(err) };
+      if (isFocusError(err)) {
+        // フォーカスが戻れば成功する種類の失敗 → クリック待ちへ
+        armClickToCopy(blob);
+        return { ok: true, deferred: true, reason: errorMessage(err) };
+      }
+      // それ以外（巨大画像の展開失敗など）は待っても直らない → ファイル保存に切り替える
+      const name = saveAsDownload(blob, err);
+      return { ok: true, deferred: true, fallback: 'download', file: name, reason: errorMessage(err) };
     }
   }
 
@@ -526,9 +532,48 @@
     await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
   }
 
+  /** Chrome は「Document is not focused.」という NotAllowedError で失敗する */
+  function isFocusError(err) {
+    return !!err && err.name === 'NotAllowedError' && /focus/i.test(errorMessage(err));
+  }
+
+  /**
+   * クリップボードに書けなかったときの最終手段。PNG をダウンロードとして保存する。
+   * 撮影結果を失わないことを最優先にしている（撮り直しには数十秒かかる）。
+   *
+   * @returns {string} 保存したファイル名
+   */
+  function saveAsDownload(blob, cause) {
+    // ローカル時刻で fullpage-YYYYMMDD-HHMMSS.png
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
+      '-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+    const name = 'fullpage-' + stamp + '.png';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.style.display = 'none';
+    document.documentElement.appendChild(a);
+    a.click();
+    a.remove();
+    // すぐ revoke するとダウンロードが始まる前に無効になることがある
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+    showToast(
+      'クリップボードへ書き込めなかったため、ファイルに保存しました\n' + name +
+      (cause ? '\n（理由: ' + errorMessage(cause) + '）' : ''),
+      'info',
+      { duration: 10000 }
+    );
+    return name;
+  }
+
   /**
    * フォーカス不足でコピーできなかったときの救済措置。
    * ページがフォーカスを取り戻す（クリック or ウィンドウ復帰）まで待って書き込む。
+   * それでも駄目なら、または時間切れならファイル保存に切り替える。
    */
   function armClickToCopy(blob) {
     disarmClickToCopy();
@@ -545,15 +590,17 @@
         showToast('コピーしました', 'success');
       } catch (err) {
         disarmClickToCopy();
-        showToast('コピーに失敗しました: ' + errorMessage(err), 'error');
+        saveAsDownload(blob, err);
       }
     };
 
     window.addEventListener('pointerdown', retry, { once: true, capture: true });
     window.addEventListener('focus', retry, { once: true });
     const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
       disarmClickToCopy();
-      showToast('コピーを中断しました（時間切れ）', 'error');
+      saveAsDownload(blob, new Error('クリックを 15 秒待ちましたが、フォーカスが戻りませんでした'));
     }, 15000);
 
     pendingCopyCleanup = () => {
@@ -593,6 +640,9 @@
     error: { bg: 'rgba(69, 10, 10, 0.94)', accent: '#f87171' },
   };
 
+  /** 表示時間（ms）。エラーは読んで対処できる長さにする */
+  const TOAST_DURATION = { success: 1800, info: 4000, error: 8000 };
+
   /**
    * 画面右上にトーストを表示する。
    *
@@ -629,7 +679,7 @@
     style.textContent = [
       '.toast {',
       '  display: flex; align-items: center; gap: 8px;',
-      '  max-width: 320px; padding: 10px 14px;',
+      '  max-width: 380px; padding: 10px 14px;',
       '  border-radius: 10px;',
       '  background: ' + palette.bg + ';',
       '  color: #f8fafc;',
@@ -656,6 +706,7 @@
     document.documentElement.appendChild(host);
 
     // ページの CSS アニメーションと衝突しない Web Animations API を使う
+    const duration = opts.duration || TOAST_DURATION[variant] || TOAST_DURATION.success;
     if (opts.persist) {
       box.animate(
         [{ opacity: 0, transform: 'translateY(-8px)' }, { opacity: 1, transform: 'none' }],
@@ -665,11 +716,12 @@
       const anim = box.animate(
         [
           { opacity: 0, transform: 'translateY(-8px) scale(.98)' },
-          { opacity: 1, transform: 'none', offset: 0.1 },
-          { opacity: 1, transform: 'none', offset: 0.8 },
+          // 表示時間が長くても、出入りのアニメーションは同じ長さ（約180ms / 360ms）に保つ
+          { opacity: 1, transform: 'none', offset: Math.min(0.1, 180 / duration) },
+          { opacity: 1, transform: 'none', offset: 1 - Math.min(0.2, 360 / duration) },
           { opacity: 0, transform: 'translateY(-8px)' },
         ],
-        { duration: 1800, easing: 'ease-out', fill: 'forwards' }
+        { duration, easing: 'ease-out', fill: 'forwards' }
       );
       anim.finished.then(() => host.remove()).catch(() => host.remove());
     }
