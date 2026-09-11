@@ -53,7 +53,7 @@
   let capture = null;
   /**
    * 隠す候補の要素リスト（撮影開始後に一度だけ走査してキャッシュする）。
-   * 各要素は {el, kind, hidden, prevValue, prevPriority} の形で復元情報を持つ。
+   * 各要素は {el, kind, hidden, prev} の形で復元情報を持つ。
    */
   let fixedCandidates = null;
   /** クリック待ちフォールバックの後始末関数 */
@@ -206,7 +206,55 @@
       style.textContent = 'html, body { scroll-behavior: auto !important; }';
       document.documentElement.appendChild(style);
     }
-    return { ok: true, mode: el ? 'element' : 'window' };
+    // smooth スクロールを無効化してから、1画面分動かして「動かない要素」を観測する
+    capture.staticElements = probeStaticElements();
+    return { ok: true, mode: el ? 'element' : 'window', staticCount: capture.staticElements.size };
+  }
+
+  /**
+   * 撮影対象を1画面分スクロールし、それでも画面上の位置が変わらなかった要素を集める。
+   *
+   * 「重複して写る要素」とは定義上「スクロールしても動かない要素」なので、
+   * fixed / 貼り付いた sticky / 領域の外から重なるオーバーレイ / 外側基準で絶対配置された
+   * 要素を、CSS の性質を推測せずに一つの基準で拾える。
+   * 同期的に layout を読むだけなので撮影は発生せず、終わったら元の位置に戻す。
+   *
+   * @returns {Set<Element>}
+   */
+  function probeStaticElements() {
+    const found = new Set();
+    const el = capture.el;
+    const scroller = el || getScroller();
+    const maxScroll = scroller.scrollHeight - scroller.clientHeight;
+    if (maxScroll < 2) return found; // 1画面に収まるページは重複しようがない
+
+    const region = capture.region;
+    const setScroll = (y) => {
+      if (el) el.scrollTop = y;
+      else window.scrollTo(window.scrollX, y);
+    };
+    const intersects = (r) =>
+      r.width >= 2 && r.height >= 2 &&
+      r.right > region.left && r.left < region.left + region.width &&
+      r.bottom > region.top && r.top < region.top + region.height;
+
+    const savedY = el ? el.scrollTop : window.scrollY;
+    setScroll(0);
+    const topsAtZero = new Map();
+    for (const node of document.querySelectorAll('body *')) {
+      if (!node.style || node.hasAttribute(TOAST_ATTR)) continue;
+      if (el && (node === el || node.contains(el))) continue; // 対象自身とその祖先は動かなくて当然
+      const r = node.getBoundingClientRect();
+      if (intersects(r)) topsAtZero.set(node, r.top);
+    }
+
+    setScroll(Math.min(region.height, maxScroll));
+    for (const [node, top] of topsAtZero) {
+      const r = node.getBoundingClientRect();
+      if (Math.abs(r.top - top) < 1 && r.width >= 2 && r.height >= 2) found.add(node);
+    }
+    setScroll(savedY);
+    return found;
   }
 
   function endCapture() {
@@ -302,14 +350,15 @@
       return true;
     }
 
-    // 5) 1コマ目の fixed / オーバーレイは、上半分から始まるもの（ヘッダー類）を
+    // 5) 1コマ目の fixed / static は、上半分から始まるもの（ヘッダー類）を
     //    本来の位置とみなして1回だけ写す。下半分のもの（バナー・チャットボタン・
     //    入力欄）は本文を覆っているので1コマ目でも隠す。
     if (info.first && rect.top < (regionTop + regionBottom) / 2) return false;
 
-    // 6) overlay = スクロール領域の DOM の外にあって領域に重なる要素（要素モードのみ）。
-    //    入力欄や「最下部へ」ボタンなど。スクロールしても動かず、下の本文を毎コマ隠す。
-    if (info.kind === 'overlay') return true;
+    // 6) static = プローブで「スクロールしても動かなかった」要素。
+    //    「最下部へ」ボタンや入力欄のオーバーレイなど。全コマに重複して写り、
+    //    下の本文を毎コマ隠す。
+    if (info.kind === 'static') return true;
 
     // 7) fixed は定義上つねにビューポートへ貼り付く＝全コマに重複して写る。
     //    全画面を覆うモーダルや Cookie バナーの暗幕もここで隠れるが、これは意図通り。
@@ -363,37 +412,34 @@
   /**
    * 隠す候補をページ全体から一度だけ収集する。
    *
-   *   - fixed / sticky な要素（両モード共通）
-   *   - 要素モードではさらに、スクロール要素の DOM の外にあって撮影領域に重なる要素
-   *     （= スクロールしても動かないオーバーレイ）。親が既に候補なら子は見ない
+   *   - static … プローブで「スクロールしても動かなかった」要素（fixed・貼り付いた sticky・
+   *              オーバーレイ・外側基準の絶対配置を含む）
+   *   - sticky … 位置指定が sticky の要素（プローブ時点で貼り付いていなくても、
+   *              後で貼り付く可能性があるので候補に入れる）
+   *   - fixed  … 位置指定が fixed の要素（プローブ時点で見えていなかったもの）
    *
+   * 祖先が既に候補なら子は見ない（親の判定に従わせる。opacity は子ごと消えるため）。
    * getComputedStyle は要素数に比例して重い（数千要素で数百ms）ため、
    * 全走査はここ一回きり。以降のコマではこのリストだけを再評価する。
    */
   function collectFixedCandidates() {
     const list = [];
     const scrollEl = capture ? capture.el : null;
-    const region = capture ? capture.region : null;
+    const statics = (capture && capture.staticElements) || new Set();
 
     for (const el of document.querySelectorAll('body *')) {
       if (!el.style) continue; // inline style を持たない要素は隠しようがない
       if (el.hasAttribute(TOAST_ATTR)) continue; // 自前のトーストは対象外
-
-      if (scrollEl && !scrollEl.contains(el) && !el.contains(scrollEl)) {
-        // スクロール要素の子孫でも祖先でもない → 領域に重なっていればオーバーレイ
-        if (list.some((c) => c.kind === 'overlay' && c.el.contains(el))) continue;
-        const r = el.getBoundingClientRect();
-        if (r.width < 2 || r.height < 2) continue;
-        const overlaps =
-          r.right > region.left && r.left < region.left + region.width &&
-          r.bottom > region.top && r.top < region.top + region.height;
-        if (overlaps) list.push({ el, kind: 'overlay', hidden: false, prevValue: '', prevPriority: '' });
-        continue;
-      }
+      if (scrollEl && (el === scrollEl || el.contains(scrollEl))) continue; // 対象自身と祖先
 
       const position = window.getComputedStyle(el).position;
-      if (position !== 'fixed' && position !== 'sticky') continue;
-      list.push({ el, kind: position, hidden: false, prevValue: '', prevPriority: '' });
+      const isStatic = statics.has(el);
+      if (!isStatic && position !== 'fixed' && position !== 'sticky') continue;
+
+      const kind = position === 'sticky' ? 'sticky' : position === 'fixed' ? 'fixed' : 'static';
+      // 祖先が既に候補なら子は見ない。親を隠せば opacity で子も消え、親を残すなら子も残す
+      if (list.some((c) => c.el.contains(el))) continue;
+      list.push({ el, kind, hidden: false, prev: null });
     }
     return list;
   }
@@ -436,7 +482,7 @@
         position: style.position,
         // 自分で隠した分は判定から除外する（さもないと二度と復帰できない）
         visibility: record.hidden ? 'visible' : style.visibility,
-        opacity: style.opacity,
+        opacity: record.hidden ? '1' : style.opacity,
         top: style.top,
         bottom: style.bottom,
         rect: el.getBoundingClientRect(),
@@ -448,11 +494,7 @@
       });
 
       if (shouldHide && !record.hidden) {
-        record.prevValue = el.style.getPropertyValue('visibility');
-        record.prevPriority = el.style.getPropertyPriority('visibility');
-        el.style.setProperty('visibility', 'hidden', 'important');
-        el.setAttribute(HIDDEN_ATTR, '');
-        record.hidden = true;
+        hideElement(record);
       } else if (!shouldHide && record.hidden) {
         unhide(record);
       }
@@ -472,14 +514,35 @@
     return { ok: true, count: 0 };
   }
 
+  /** 撮影中に隠すために上書きする inline プロパティ */
+  const HIDE_PROPS = {
+    // visibility だけだと、子が明示的に visible を持つ場合に子が見えてしまう。
+    // opacity は子ごと必ず消える。transition は opacity のアニメーションを止めるため。
+    visibility: 'hidden',
+    opacity: '0',
+    transition: 'none',
+  };
+
+  function hideElement(record) {
+    const el = record.el;
+    record.prev = {};
+    for (const prop of Object.keys(HIDE_PROPS)) {
+      record.prev[prop] = { value: el.style.getPropertyValue(prop), priority: el.style.getPropertyPriority(prop) };
+      el.style.setProperty(prop, HIDE_PROPS[prop], 'important');
+    }
+    el.setAttribute(HIDDEN_ATTR, '');
+    record.hidden = true;
+  }
+
   function unhide(record) {
     const el = record.el;
-    if (record.prevValue) {
-      el.style.setProperty('visibility', record.prevValue, record.prevPriority);
-    } else {
-      el.style.removeProperty('visibility');
+    for (const prop of Object.keys(HIDE_PROPS)) {
+      const prev = record.prev && record.prev[prop];
+      if (prev && prev.value) el.style.setProperty(prop, prev.value, prev.priority);
+      else el.style.removeProperty(prop);
     }
     el.removeAttribute(HIDDEN_ATTR);
+    record.prev = null;
     record.hidden = false;
   }
 
