@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "FullPage Capture & Copy",
+  "version": "1.0.0",
+  "description": "ページ全体を自動スクロールで撮影し、1枚のPNG画像としてクリップボードへ直接コピーします。",
+  "minimum_chrome_version": "116",
+
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "offscreen",
+    "clipboardWrite"
+  ],
+
+  "background": {
+    "service_worker": "src/background.js"
+  },
+
+  "action": {
+    "default_title": "ページ全体をキャプチャしてコピー",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -1,0 +1,119 @@
+# FullPage Capture & Copy
+
+開いている Web ページ全体を自動スクロールで撮影し、**1枚の PNG としてクリップボードへ直接コピー**する Chrome 拡張機能（Manifest V3 / 完全ローカル動作）。
+
+---
+
+## インストール
+
+1. Chrome で `chrome://extensions` を開く
+2. 右上の **デベロッパーモード** をオンにする
+3. **パッケージ化されていない拡張機能を読み込む** → このフォルダを選択
+4. ツールバーにピン留めして、任意のページでアイコンをクリック
+
+> 撮影が始まるとアイコンにバッジ（`···`）が出ます。完了するとページ右上に
+> 「コピーしました」のトーストが 1.8 秒表示されます。
+
+---
+
+## ファイル構成
+
+```
+FullPage Capture & Copy/
+├── manifest.json      MV3 マニフェスト（activeTab / scripting / offscreen / clipboardWrite）
+├── src/
+│   ├── background.js  Service Worker: 撮影ループの司令塔
+│   ├── content.js     Content Script: 計測・スクロール・固定要素制御・クリップボード・トースト
+│   ├── offscreen.html Offscreen ドキュメントの器
+│   └── offscreen.js   Canvas での画像結合
+├── icons/             16 / 32 / 48 / 128 px
+├── tools/
+│   └── make-icons.ps1 アイコン再生成スクリプト（色は先頭の $BackgroundColor で変更）
+└── README.md
+```
+
+---
+
+## 処理の流れ
+
+```
+[アイコンクリック]
+      │
+      ▼
+Service Worker ──BEGIN_CAPTURE──────────▶ Content Script  (スクロール位置を保存 / smooth無効化)
+      │        ──GET_PAGE_METRICS──────▶                  (ページ高さ・ビューポート・DPRを計測)
+      │        ──STITCH_BEGIN {metrics}─▶ Offscreen       (結合セッション開始)
+      │
+      │  ┌── ループ ─────────────────────────────────────────────────┐
+      │  │  ──SCROLL_TO {y}────────────▶ Content Script              │
+      │  │  ◀──実際に到達したY座標──────                               │
+      │  │  ──TOGGLE_FIXED_ELEMENTS─────▶ (2コマ目以降、撮影の直前)       │
+      │  │  chrome.tabs.captureVisibleTab()   ※アクティブタブか毎回確認  │
+      │  │  ──STITCH_ADD_FRAME {dataUrl,y}▶ Offscreen (その場で描画→破棄) │
+      │  └───────────────────────────────────────────────────────────┘
+      │
+      │        ──END_CAPTURE────────────▶ Content Script (固定要素とスクロール位置を復元)
+      │        ──STITCH_FINISH──────────▶ Offscreen       (PNG化、チャンク数を返す)
+      │
+      │  ┌── チャンクごと（6MB単位）────────────────────────────────┐
+      │  │  ──STITCH_READ_CHUNK {i}─────▶ Offscreen → base64        │
+      │  │  ──RECEIVE_IMAGE_CHUNK {i}───▶ Content Script (即デコード) │
+      │  └──────────────────────────────────────────────────────────┘
+      ▼
+Content Script ──COPY_TO_CLIPBOARD──▶ Blob を組み立てて navigator.clipboard.write()
+               ──SHOW_TOAST─────────▶ 右上にトースト表示
+```
+
+### 仕様書からの意図的な変更点
+
+| 項目 | 仕様書 | 実装 | 理由 |
+| --- | --- | --- | --- |
+| `COPY_TO_CLIPBOARD` の経路 | Offscreen → Content Script | Offscreen → **Service Worker** → Content Script | Offscreen ドキュメントは `chrome.tabs` を持たず、Content Script へ直接送信できないため |
+| クリップボード書き込みの実行場所 | （Blob URL を受け渡し） | Content Script が分割受信した base64 を Blob 化して書き込み | `navigator.clipboard.write()` はドキュメントのフォーカスを要求する。不可視の Offscreen は永久にフォーカスを持てない。また Blob URL はオリジン単位で隔離されており、ページ側からは読めない |
+| `STITCH_IMAGES`（全コマを一括送信） | `images: string[]` | `STITCH_BEGIN` / `STITCH_ADD_FRAME {dataUrl, y}` / `STITCH_FINISH` / `STITCH_READ_CHUNK` に分割 | (1) 末尾のコマはスクロールがクランプされて要求値どおりに進まない。**実際に到達した Y 座標**を渡さないと結合がズレる。(2) 全コマや結合後の PNG を1メッセージで送ると、縦長ページでは拡張機能メッセージのサイズ上限を超えて失敗する。1コマ／数MBのチャンク単位に分けて転送する |
+| `TOGGLE_FIXED_ELEMENTS` の呼び出し | 2コマ目の前に1回 | **2コマ目以降の毎コマ** | どの要素が「貼り付いているか」はスクロール位置で変わる。1回だけの判定だと、ページ中腹の sticky なテーブルヘッダーが結合画像から完全に消えてしまう |
+| メッセージ追加 | — | `PING` / `BEGIN_CAPTURE` / `END_CAPTURE` / `RECEIVE_IMAGE_CHUNK` | Content Script の生存確認、状態の保存・復元、分割転送のため |
+
+---
+
+## 設計上の要点
+
+- **`captureVisibleTab` のクォータ（約2回/秒）** が処理速度の実質的な下限。`MIN_CAPTURE_INTERVAL_MS = 520` で先回りして待ち、それでも超過した場合は指数的にリトライする。この待機時間がそのままページの描画待ちにもなるため、無駄は小さい。
+- **固定要素は `visibility: hidden`** で隠す。`display: none` だと `sticky` 要素の占有領域が消えてページ高さが変わり、計測済みの値とズレる。`visibility` は矩形を保つので、隠したまま位置を測り直せるという利点もある。
+- **「隠すべき要素」はコマごとに判定し直す**。判定基準は一貫して「この要素は複数のコマに重複して写るか」。
+  - `fixed` … 定義上つねに重複するので隠す。
+  - `sticky` … **そのスクロール位置で実際にビューポート端へ貼り付いているときだけ**隠す。これによりページ中腹の sticky なテーブルヘッダーは「本来の位置に1回だけ写り、貼り付いている間は消える」という理想的な結果になる。
+  - 左右方向の sticky（固定列）は縦結合では重複しないため対象外。
+  - 元々不可視・サイズ0・そのコマの画面外にある要素は触らない。
+  - 全画面を覆うモーダルや Cookie バナーの暗幕も `fixed` として隠れる。これは意図通りで、隠さないと「暗幕越しのページ」が延々と続く読みにくい画像になる。
+- **走査は最初の1回だけ**。`getComputedStyle` は要素数に比例して重い（数千要素で数百ms）ため、全要素の走査は1回きりで `fixed`/`sticky` の候補（通常20個未満）をキャッシュし、以降のコマではその候補だけを `getBoundingClientRect` で再評価する。
+- **スクロールバーを結合前に切り落とす**。`documentElement.clientWidth/Height`（バーを除く）と `window.innerWidth/Height`（バーを含む＝撮影画像の範囲）を別々に計測し、差分をトリミングしている。これをしないと横スクロールバーの帯が結合画像の途中に何本も現れる。
+- **スケールは実測値**。`devicePixelRatio` を信じず `撮影画像の幅 ÷ CSSピクセル幅` で求めるため、ブラウザズームにも追従する。
+- **Canvas 上限へのフォールバック**。1辺 16384px / 総面積 64M px（RGBA で約 256MB）を超える場合は自動で縮小し、トーストに縮小後のサイズを表示する。Chrome 自体は 2^28 px まで許すが、それは 1GB のメモリになり PNG 化・転送も現実的でない。
+- **メモリ対策**。コマは撮影のたびに Offscreen へ送って「デコード → 描画 → 即 `close()`」し、Service Worker にも Offscreen にもコマを溜めない。結合後は Canvas を手放し、転送が終わったら Offscreen ドキュメントを閉じる。
+- **結合後の PNG は 6MB ずつ分割して転送**。チャンク境界を 3 の倍数バイトに揃えているため各チャンクの base64 は独立しており、Content Script は受け取るそばからデコードできる（巨大な文字列を連結しない）。
+- **同時実行は拡張機能全体で1件**。`captureVisibleTab` のクォータも Offscreen ドキュメントも共有資源なので、別タブで処理中なら「処理中」のトーストを出して受け付けない。
+- **撮影中の異常を検知して止まる**。スクロール位置が前回から進まなければ即終了（`overflow: hidden` のページで同じ画面を撮り続けない）。タブが切り替えられたら中断（`captureVisibleTab` はアクティブタブを撮るため別ページが混ざる）。タブが非表示で `requestAnimationFrame` が止まっても、タイムアウトで Service Worker を待たせ続けない。
+
+---
+
+## 既知の制限
+
+- **HTTPS でないページ（http://）では画像をコピーできない**。`navigator.clipboard` は安全なコンテキストでしか存在せず、画像を `execCommand('copy')` で代替する手段もない。該当ページではエラートーストで案内する。
+- **Shadow DOM / iframe 内の固定要素は隠せない**（`document.querySelectorAll('body *')` の探索範囲外）。
+- **ページ本体ではなく内部の div がスクロールするタイプの SPA** は `window.scrollTo` が効かず、1画面分しか撮れない。
+- **遅延読み込み画像**は、そのコマの待機時間内に読み込みが間に合わないと空白で写ることがある。`SETTLE_MS`（`src/background.js`）を増やすと改善する。
+- **`background-attachment: fixed` の背景**は要素ではないため隠せず、各コマで繰り返される。
+- **極端に縦長のページは解像度が落ちる**。Canvas の上限（1辺 16384px）に収めるため自動縮小するので、たとえば 60000px のページは横幅 400px 程度まで縮む。1枚の画像として出力する以上これは避けられない（縮小せずに打ち切るより、全体が残る方を選んでいる）。
+
+---
+
+## チューニング
+
+`src/background.js` 冒頭の定数で調整できる。
+
+| 定数 | 既定値 | 意味 |
+| --- | --- | --- |
+| `SETTLE_MS` | 150 | スクロール後の描画待ち。遅延読込が多いページでは 400〜600 程度に |
+| `MIN_CAPTURE_INTERVAL_MS` | 520 | 撮影の最小間隔。下げすぎるとクォータエラーでリトライが増え、かえって遅くなる |
+| `MAX_FRAMES` | 80 | 撮影コマ数の上限（無限スクロール対策の安全弁） |

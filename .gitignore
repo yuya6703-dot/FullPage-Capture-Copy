@@ -1,0 +1,14 @@
+# OS / エディタ
+Thumbs.db
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# リリース用に生成する zip
+/dist/
+*.zip
+
+# 依存や一時ファイル（現状は使っていないが将来のため）
+node_modules/
+*.log
