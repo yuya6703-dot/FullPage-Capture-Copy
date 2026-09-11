@@ -15,6 +15,9 @@
  * メモリの両方を抑えるため（全コマの ImageBitmap を同時に持つと数百MBになる）。
  * ========================================================================= */
 
+/** メッセージ仕様のバージョン。Service Worker と一致しなければ作り直される */
+const PROTOCOL_VERSION = 2;
+
 /** Chrome の 2D Canvas の1辺の上限 */
 const MAX_CANVAS_DIMENSION = 16384;
 
@@ -77,7 +80,7 @@ function beginSession(metrics) {
     frameCount: 0,
     blob: null,
   };
-  return { ok: true };
+  return { ok: true, protocol: PROTOCOL_VERSION };
 }
 
 /**
@@ -95,9 +98,13 @@ async function addFrame(dataUrl, y) {
     if (!s.canvas) createCanvas(s, bitmap.width);
 
     const m = s.metrics;
-    // 撮影画像からスクロールバー部分を除いた領域だけを切り出す
-    const sw = Math.min(bitmap.width, Math.round(m.viewportWidth * s.scale));
-    const sh = Math.min(bitmap.height, Math.round(m.viewportHeight * s.scale));
+    // 撮影画像から「撮影領域」だけを切り出す。
+    //   window モード … 左上原点、スクロールバーを除いた範囲
+    //   要素モード   … その要素が画面内に見えている範囲（regionLeft/Top から）
+    const sx = Math.round((m.regionLeft || 0) * s.scale);
+    const sy = Math.round((m.regionTop || 0) * s.scale);
+    const sw = Math.min(bitmap.width - sx, Math.round(m.viewportWidth * s.scale));
+    const sh = Math.min(bitmap.height - sy, Math.round(m.viewportHeight * s.scale));
 
     // 上端と下端を「同じ丸め関数」から導くのが要点。
     //   dy = round(y × k), 下端 = round((y + ビューポート高) × k)
@@ -108,7 +115,7 @@ async function addFrame(dataUrl, y) {
     const dw = Math.max(1, Math.round(m.viewportWidth * s.k));
     const dh = Math.max(1, dBottom - dy);
 
-    s.ctx.drawImage(bitmap, 0, 0, sw, sh, 0, dy, dw, dh);
+    s.ctx.drawImage(bitmap, sx, sy, sw, sh, 0, dy, dw, dh);
     s.frameCount++;
   } finally {
     bitmap.close(); // GC 待ちにせず即座に解放する

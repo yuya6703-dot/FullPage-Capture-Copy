@@ -30,17 +30,32 @@
     /* 無効化済みコンテキストの後始末は失敗しても構わない */
   }
 
+  /**
+   * メッセージ仕様のバージョン。Service Worker と一致しない場合は再注入される。
+   * （ファイルを更新しても拡張機能をリロードするまで古いコードが残るため）
+   */
+  const PROTOCOL_VERSION = 2;
+
   const STYLE_ID = '__fpcc_capture_style__';
   const TOAST_ATTR = 'data-fpcc-toast';
   const HIDDEN_ATTR = 'data-fpcc-hidden';
 
+  /** 内側のスクロール領域を撮影対象とみなすための、ビューポートに対する最小面積比 */
+  const MIN_SCROLLER_AREA_RATIO = 0.25;
+
   /**
-   * fixed / sticky 要素の候補リスト（撮影開始後に一度だけ走査してキャッシュする）。
-   * 各要素は {el, hidden, prevValue, prevPriority} の形で復元情報を持つ。
+   * 撮影中の状態。beginCapture で決定し endCapture で破棄する。
+   *   el            … スクロールさせる要素（null なら window）
+   *   region        … 撮影画像から切り出す範囲（CSSピクセル、ビューポート基準）
+   *   contentOffset … 領域の上端が、スクロール内容の何px目に当たるか（通常 0）
+   *   stickTop/Bottom … sticky 要素が貼り付く上下の辺（要素モードでは要素の client 領域）
+   */
+  let capture = null;
+  /**
+   * 隠す候補の要素リスト（撮影開始後に一度だけ走査してキャッシュする）。
+   * 各要素は {el, kind, hidden, prevValue, prevPriority} の形で復元情報を持つ。
    */
   let fixedCandidates = null;
-  /** 撮影開始時のスクロール位置 */
-  let savedScroll = null;
   /** クリック待ちフォールバックの後始末関数 */
   let pendingCopyCleanup = null;
   /** 分割転送中の PNG（{count, parts: Uint8Array[]}） */
@@ -65,19 +80,67 @@
   }
 
   /**
+   * ページ本体の代わりにスクロールしている内側の要素を探す。
+   *
+   * ChatGPT などの SPA はページ本体が一切スクロールせず、内側の div が
+   * 会話をスクロールしている。その場合 window.scrollTo は効かないため、
+   * 「overflow-y が auto/scroll で、実際にスクロール可能で、画面の一定以上を
+   * 占める要素」のうち、スクロール可能な量が最も大きいものを撮影対象にする。
+   *
+   * @returns {Element|null} null なら window をスクロールする
+   */
+  function findScrollTarget() {
+    const root = getScroller();
+    const vw = root.clientWidth;
+    const vh = root.clientHeight;
+    const minArea = vw * vh * MIN_SCROLLER_AREA_RATIO;
+
+    let best = null;
+    // ページ本体がスクロールできるなら、それを基準値にして「より大きく動く要素」だけを採用する
+    let bestRange = Math.max(0, root.scrollHeight - root.clientHeight);
+
+    for (const el of document.querySelectorAll('body *')) {
+      // 安い判定を先に：スクロール可能量が基準以下ならスタイルは見ない
+      const range = el.scrollHeight - el.clientHeight;
+      if (range <= 1 || range <= bestRange) continue;
+
+      const overflowY = window.getComputedStyle(el).overflowY;
+      if (overflowY !== 'auto' && overflowY !== 'scroll' && overflowY !== 'overlay') continue;
+
+      const r = el.getBoundingClientRect();
+      const visibleWidth = Math.min(r.right, vw) - Math.max(r.left, 0);
+      const visibleHeight = Math.min(r.bottom, vh) - Math.max(r.top, 0);
+      if (visibleWidth <= 0 || visibleHeight <= 0) continue;
+      if (visibleWidth * visibleHeight < minArea) continue; // 小さなウィジェットは対象外
+
+      best = el;
+      bestRange = range;
+    }
+    return best;
+  }
+
+  /**
    * 結合に必要な寸法を一括で返す。
    *
-   * viewportWidth/Height はスクロールバーを除いた「コンテンツ領域」、
+   * viewportWidth/Height は撮影画像から切り出す領域（スクロールバーを除く）、
    * captureWidth/Height はスクロールバーを含む「撮影される画像の領域」。
    * この2つを分けておくことで、Offscreen 側でスクロールバーを切り落とせる。
    * （切り落とさないと、横スクロールバーの帯が結合画像の途中に何本も現れる）
+   *
+   * 要素モードでは領域が「その要素の画面内に見えている部分」になり、
+   * regionLeft/Top が 0 以外になる。
    */
   function getPageMetrics() {
-    const scroller = getScroller();
+    if (!capture) throw new Error('撮影が開始されていません');
+    const region = capture.region;
+    const scrollHeight = capture.el ? capture.el.scrollHeight : getScroller().scrollHeight;
     return {
-      totalHeight: scroller.scrollHeight,
-      viewportWidth: scroller.clientWidth,
-      viewportHeight: scroller.clientHeight,
+      mode: capture.el ? 'element' : 'window',
+      totalHeight: scrollHeight - capture.contentOffset,
+      viewportWidth: region.width,
+      viewportHeight: region.height,
+      regionLeft: region.left,
+      regionTop: region.top,
       captureWidth: window.innerWidth,
       captureHeight: window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
@@ -92,7 +155,48 @@
     // 前回の実行が途中で終わっていた場合の残骸を片付ける
     disarmClickToCopy();
     imageChunks = null;
-    savedScroll = { x: window.scrollX, y: window.scrollY };
+    if (capture) endCapture();
+
+    const root = getScroller();
+    const vw = root.clientWidth;
+    const vh = root.clientHeight;
+    const el = findScrollTarget();
+
+    if (el) {
+      // 境界線とスクロールバーを除いた client 領域のうち、画面内に見えている部分を撮る
+      const r = el.getBoundingClientRect();
+      const clientTop = r.top + el.clientTop;
+      const clientLeft = r.left + el.clientLeft;
+      const left = Math.max(clientLeft, 0);
+      const top = Math.max(clientTop, 0);
+      const right = Math.min(clientLeft + el.clientWidth, vw);
+      const bottom = Math.min(clientTop + el.clientHeight, vh);
+
+      capture = {
+        el,
+        region: { left, top, width: right - left, height: bottom - top },
+        contentOffset: top - clientTop,
+        stickTop: clientTop,
+        stickBottom: clientTop + el.clientHeight,
+        savedScroll: { x: window.scrollX, y: window.scrollY, elTop: el.scrollTop, elLeft: el.scrollLeft },
+        prevScrollBehavior: {
+          value: el.style.getPropertyValue('scroll-behavior'),
+          priority: el.style.getPropertyPriority('scroll-behavior'),
+        },
+      };
+      // 内側の要素の smooth スクロールも撮影中だけ無効化する
+      el.style.setProperty('scroll-behavior', 'auto', 'important');
+    } else {
+      capture = {
+        el: null,
+        region: { left: 0, top: 0, width: vw, height: vh },
+        contentOffset: 0,
+        stickTop: 0,
+        stickBottom: vh,
+        savedScroll: { x: window.scrollX, y: window.scrollY },
+        prevScrollBehavior: null,
+      };
+    }
 
     // scroll-behavior: smooth のページはスクロールが即座に完了せず、
     // 撮影がズレる。撮影中だけ auto に上書きする。
@@ -102,14 +206,25 @@
       style.textContent = 'html, body { scroll-behavior: auto !important; }';
       document.documentElement.appendChild(style);
     }
-    return { ok: true };
+    return { ok: true, mode: el ? 'element' : 'window' };
   }
 
   function endCapture() {
     toggleFixedElements(false);
-    if (savedScroll) {
-      window.scrollTo(savedScroll.x, savedScroll.y);
-      savedScroll = null;
+    if (capture) {
+      const saved = capture.savedScroll;
+      if (capture.el) {
+        capture.el.scrollTop = saved.elTop;
+        capture.el.scrollLeft = saved.elLeft;
+        const prev = capture.prevScrollBehavior;
+        if (prev && prev.value) {
+          capture.el.style.setProperty('scroll-behavior', prev.value, prev.priority);
+        } else {
+          capture.el.style.removeProperty('scroll-behavior');
+        }
+      }
+      window.scrollTo(saved.x, saved.y);
+      capture = null;
     }
     // スクロールを戻し終えてから scroll-behavior の上書きを解除する
     const style = document.getElementById(STYLE_ID);
@@ -123,16 +238,21 @@
 
   /**
    * 指定位置へスクロールし、"実際に到達した位置" を返す。
-   * ページ末尾では要求値より小さくクランプされるため、この実測値を
+   * 末尾では要求値より小さくクランプされるため、この実測値を
    * そのまま結合時の Y 座標として使うことでズレを防げる。
    */
   async function scrollToY(y) {
-    // 横位置は触らない（横スクロール中のページでも撮影範囲が変わらないように）
-    window.scrollTo(window.scrollX, y);
+    const el = capture && capture.el;
+    if (el) {
+      el.scrollTop = y;
+    } else {
+      // 横位置は触らない（横スクロール中のページでも撮影範囲が変わらないように）
+      window.scrollTo(window.scrollX, y);
+    }
     // レイアウト確定と描画を1フレームずつ待つ
     await nextFrame();
     await nextFrame();
-    return { y: window.scrollY };
+    return { y: el ? el.scrollTop : window.scrollY };
   }
 
   /* ========================================================================
@@ -150,6 +270,9 @@
    */
   function shouldHideDuringCapture(info) {
     const rect = info.rect;
+    // 撮影領域（window モードでは 0〜ビューポート高、要素モードではその要素の見えている範囲）
+    const regionTop = info.regionTop !== undefined ? info.regionTop : 0;
+    const regionBottom = info.regionBottom !== undefined ? info.regionBottom : info.viewportHeight;
 
     // 1) 元々見えていない要素は触らない。
     //    隠す意味がない上に、復元時に元のスタイルを壊すリスクだけが残る。
@@ -160,36 +283,45 @@
     //    画面には写らないので対象外。
     if (rect.width < 2 || rect.height < 2) return false;
 
-    // 3) このコマの画面外にある要素。そもそも写らないので触る必要がない。
-    if (rect.bottom <= 0 || rect.top >= info.viewportHeight) return false;
+    // 3) このコマの撮影領域の外にある要素。そもそも写らないので触る必要がない。
+    if (rect.bottom <= regionTop || rect.top >= regionBottom) return false;
 
-    // 4) fixed は定義上つねにビューポートへ貼り付く＝全コマに重複して写る。
+    // 4) overlay = スクロール領域の DOM の外にあって領域に重なる要素（要素モードのみ）。
+    //    入力欄や「最下部へ」ボタンなど。スクロールしても動かず、下の本文を毎コマ隠すので
+    //    1コマ目から隠す。
+    if (info.kind === 'overlay') return true;
+
+    // 5) fixed は定義上つねにビューポートへ貼り付く＝全コマに重複して写る。
     //    全画面を覆うモーダルや Cookie バナーの暗幕もここで隠れるが、これは意図通り。
     //    隠さないと「暗幕越しのページ」が延々と続く画像になり、可読性が大きく落ちる。
     if (info.position === 'fixed') return true;
 
-    // 5) sticky は「今このスクロール位置で実際に貼り付いているか」で決める。
+    // 6) sticky は「今このスクロール位置で実際に貼り付いているか」で決める。
     //    貼り付いていない sticky は通常フロー上にあり、そのコマにしか写らない。
     //    → ページ中腹の sticky なテーブルヘッダーは、
     //      「本来の位置に1回だけ写り、貼り付いている間は消える」という理想的な結果になる。
-    if (info.position === 'sticky') return isVerticallyStuck(info);
+    //    1コマ目（スクロール位置 0）で貼り付いているものは本来の位置にあるので残す。
+    if (info.position === 'sticky') return !info.first && isVerticallyStuck(info);
 
     return false;
   }
 
   /**
-   * sticky 要素が「縦方向に」貼り付いているかを、inset との距離で判定する。
+   * sticky 要素が「縦方向に」貼り付いているかを、貼り付く辺（stickTop/Bottom）と
+   * inset との距離で判定する。
    * 結合は縦方向にしか行わないため、左右の sticky（固定列など）は重複しない＝対象外。
    */
   function isVerticallyStuck(info) {
     const rect = info.rect;
     const vh = info.viewportHeight;
+    const stickTop = info.stickTop !== undefined ? info.stickTop : 0;
+    const stickBottom = info.stickBottom !== undefined ? info.stickBottom : vh;
 
     const top = resolveInset(info.top, vh);
-    if (top !== null && rect.top <= top + 1) return true;
+    if (top !== null && rect.top <= stickTop + top + 1) return true;
 
     const bottom = resolveInset(info.bottom, vh);
-    if (bottom !== null && rect.bottom >= vh - bottom - 1) return true;
+    if (bottom !== null && rect.bottom >= stickBottom - bottom - 1) return true;
 
     return false;
   }
@@ -203,19 +335,39 @@
   }
 
   /**
-   * fixed / sticky 要素をページ全体から一度だけ収集する。
+   * 隠す候補をページ全体から一度だけ収集する。
+   *
+   *   - fixed / sticky な要素（両モード共通）
+   *   - 要素モードではさらに、スクロール要素の DOM の外にあって撮影領域に重なる要素
+   *     （= スクロールしても動かないオーバーレイ）。親が既に候補なら子は見ない
    *
    * getComputedStyle は要素数に比例して重い（数千要素で数百ms）ため、
    * 全走査はここ一回きり。以降のコマではこのリストだけを再評価する。
    */
   function collectFixedCandidates() {
     const list = [];
+    const scrollEl = capture ? capture.el : null;
+    const region = capture ? capture.region : null;
+
     for (const el of document.querySelectorAll('body *')) {
       if (!el.style) continue; // inline style を持たない要素は隠しようがない
       if (el.hasAttribute(TOAST_ATTR)) continue; // 自前のトーストは対象外
+
+      if (scrollEl && !scrollEl.contains(el) && !el.contains(scrollEl)) {
+        // スクロール要素の子孫でも祖先でもない → 領域に重なっていればオーバーレイ
+        if (list.some((c) => c.kind === 'overlay' && c.el.contains(el))) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) continue;
+        const overlaps =
+          r.right > region.left && r.left < region.left + region.width &&
+          r.bottom > region.top && r.top < region.top + region.height;
+        if (overlaps) list.push({ el, kind: 'overlay', hidden: false, prevValue: '', prevPriority: '' });
+        continue;
+      }
+
       const position = window.getComputedStyle(el).position;
       if (position !== 'fixed' && position !== 'sticky') continue;
-      list.push({ el, hidden: false, prevValue: '', prevPriority: '' });
+      list.push({ el, kind: position, hidden: false, prevValue: '', prevPriority: '' });
     }
     return list;
   }
@@ -226,18 +378,25 @@
    * hide=true は「今のスクロール位置に合わせてマスクを貼り直す」という意味で、
    * コマごとに呼ばれる。貼り付きが解除された要素はここで表示に戻る。
    *
+   * first=true（1コマ目）の扱い:
+   *   - window モード … 何も隠さない。固定ヘッダーは結合画像の先頭に1回だけ残す
+   *   - 要素モード     … オーバーレイと fixed は隠す（本文を覆っているため）。sticky は残す
+   *
    * display:none ではなく visibility:hidden を使うのが要点。
    * sticky 要素は通常フローの領域を占めるため display:none にすると
    * ページ全体の高さが変わり、計測済みの totalHeight とズレてしまう。
    * （visibility は矩形を保つので、隠したまま位置を測り直せるという利点もある）
    */
-  function toggleFixedElements(hide) {
+  function toggleFixedElements(hide, first) {
     if (!hide) return restoreFixedElements();
+    if (!capture) throw new Error('撮影が開始されていません');
+    if (first && !capture.el) return { ok: true, count: 0 };
 
     if (!fixedCandidates) fixedCandidates = collectFixedCandidates();
 
     // getPageMetrics と同じ要素から取る（後方互換モードで documentElement は当てにならない）
     const viewportHeight = getViewportHeight();
+    const region = capture.region;
     let hiddenCount = 0;
 
     for (const record of fixedCandidates) {
@@ -246,6 +405,8 @@
 
       const style = window.getComputedStyle(el);
       const shouldHide = shouldHideDuringCapture({
+        kind: record.kind,
+        first: !!first,
         position: style.position,
         // 自分で隠した分は判定から除外する（さもないと二度と復帰できない）
         visibility: record.hidden ? 'visible' : style.visibility,
@@ -254,6 +415,10 @@
         bottom: style.bottom,
         rect: el.getBoundingClientRect(),
         viewportHeight,
+        regionTop: region.top,
+        regionBottom: region.top + region.height,
+        stickTop: capture.stickTop,
+        stickBottom: capture.stickBottom,
       });
 
       if (shouldHide && !record.hidden) {
@@ -518,7 +683,7 @@
   async function handleMessage(msg) {
     switch (msg.action) {
       case 'PING':
-        return { ok: true };
+        return { ok: true, protocol: PROTOCOL_VERSION };
       case 'GET_PAGE_METRICS':
         return getPageMetrics();
       case 'BEGIN_CAPTURE':
@@ -528,7 +693,7 @@
       case 'SCROLL_TO':
         return scrollToY(msg.y);
       case 'TOGGLE_FIXED_ELEMENTS':
-        return toggleFixedElements(msg.hide);
+        return toggleFixedElements(msg.hide, msg.first);
       case 'RECEIVE_IMAGE_CHUNK':
         return receiveImageChunk(msg.index, msg.count, msg.base64);
       case 'COPY_TO_CLIPBOARD':

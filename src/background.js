@@ -26,6 +26,13 @@
 const CONTENT_SCRIPT_FILE = 'src/content.js';
 const OFFSCREEN_DOCUMENT = 'src/offscreen.html';
 
+/**
+ * メッセージ仕様のバージョン。Content Script / Offscreen と一致しなければ作り直す。
+ * ファイルを更新しても拡張機能をリロードするまで古いコードがタブに残るため、
+ * 「未知のアクション」で失敗する代わりに自動で入れ替える。
+ */
+const PROTOCOL_VERSION = 2;
+
 /* --- 撮影チューニング用パラメータ ---------------------------------------- */
 
 /** スクロール後、遅延描画（アニメーション・遅延読込）が落ち着くのを待つ時間 */
@@ -114,7 +121,7 @@ async function captureAndCopy(tab) {
     try {
       const metrics = await sendToTab(tab.id, { action: MSG.GET_PAGE_METRICS });
       assertValidMetrics(metrics);
-      await sendToOffscreen({ action: MSG.STITCH_BEGIN, metrics });
+      await beginStitchSession(metrics);
       capture = await captureFrames(tab.id, metrics);
     } finally {
       // 撮影が途中で失敗しても、ページは必ず元の状態へ戻す (Task 2.4)
@@ -177,14 +184,13 @@ async function captureFrames(tabId, metrics) {
     // 実測値が進まない。同じ画面を撮り続けないよう「前回より進んだか」で判定する。
     if (frameCount > 0 && y <= lastY) break;
 
-    // 2コマ目以降は、撮影の直前に「そのスクロール位置で実際に貼り付いている要素」
-    // だけを隠し直す (Task 2.2)。
-    //   - 1コマ目は隠さない → 固定ヘッダーは結合画像の先頭に1回だけ正しく残る
+    // 撮影の直前に「そのスクロール位置で実際に貼り付いている要素」を隠し直す (Task 2.2)。
     //   - コマごとに再評価する → 途中から貼り付く sticky も取りこぼさず、
     //     貼り付きが解除された要素は表示に戻る
-    if (frameCount > 0) {
-      await sendToTab(tabId, { action: MSG.TOGGLE_FIXED_ELEMENTS, hide: true });
-    }
+    //   - first（1コマ目）の扱いは Content Script 側が決める。window モードでは
+    //     何も隠さず固定ヘッダーを先頭に1回だけ残し、要素モードでは本文を覆う
+    //     オーバーレイだけを隠す
+    await sendToTab(tabId, { action: MSG.TOGGLE_FIXED_ELEMENTS, hide: true, first: frameCount === 0 });
     await delay(SETTLE_MS);
 
     // captureVisibleTab は「ウィンドウのアクティブタブ」を撮る。
@@ -266,6 +272,20 @@ async function ensureOffscreenDocument() {
 }
 
 /**
+ * 結合セッションを開始する。Offscreen が古い版なら作り直して再試行する。
+ */
+async function beginStitchSession(metrics) {
+  let res = await sendToOffscreen({ action: MSG.STITCH_BEGIN, metrics });
+  if (res.protocol === PROTOCOL_VERSION) return;
+  await chrome.offscreen.closeDocument().catch(() => {});
+  await ensureOffscreenDocument();
+  res = await sendToOffscreen({ action: MSG.STITCH_BEGIN, metrics });
+  if (res.protocol !== PROTOCOL_VERSION) {
+    throw new Error('Offscreen の版が一致しません。chrome://extensions で拡張機能をリロードしてください');
+  }
+}
+
+/**
  * Offscreen が保持する PNG を数MBずつ取り出し、Content Script へ中継する。
  * 最後に COPY_TO_CLIPBOARD で「全チャンク揃った」ことを伝えて書き込ませる。
  */
@@ -294,7 +314,8 @@ async function transferImageToTab(tabId, chunkCount) {
 async function ensureContentScript(tabId, url) {
   try {
     const pong = await chrome.tabs.sendMessage(tabId, { action: MSG.PING });
-    if (pong && pong.ok) return;
+    if (pong && pong.ok && pong.protocol === PROTOCOL_VERSION) return;
+    // 応答はあるが古い版 → 再注入（新しいスクリプトが古いリスナーを破棄する）
   } catch (_) {
     // 未注入 or コンテキスト無効 → 下で注入する
   }
@@ -309,7 +330,10 @@ async function ensureContentScript(tabId, url) {
     }
     throw err;
   }
-  await chrome.tabs.sendMessage(tabId, { action: MSG.PING });
+  const pong = await chrome.tabs.sendMessage(tabId, { action: MSG.PING });
+  if (!pong || pong.protocol !== PROTOCOL_VERSION) {
+    throw new Error('Content Script の版が一致しません。chrome://extensions で拡張機能をリロードしてください');
+  }
 }
 
 async function sendToTab(tabId, message) {

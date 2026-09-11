@@ -12,3 +12,6 @@ Thumbs.db
 # 依存や一時ファイル（現状は使っていないが将来のため）
 node_modules/
 *.log
+
+# Claude Code のローカル設定（検証用サーバー定義など）
+.claude/
