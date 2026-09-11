@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FullPage Capture & Copy",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "ページ全体を自動スクロールで撮影し、1枚のPNG画像としてクリップボードへ直接コピーします。",
   "minimum_chrome_version": "116",
 

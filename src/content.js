@@ -286,44 +286,70 @@
     // 3) このコマの撮影領域の外にある要素。そもそも写らないので触る必要がない。
     if (rect.bottom <= regionTop || rect.top >= regionBottom) return false;
 
-    // 4) overlay = スクロール領域の DOM の外にあって領域に重なる要素（要素モードのみ）。
-    //    入力欄や「最下部へ」ボタンなど。スクロールしても動かず、下の本文を毎コマ隠すので
-    //    1コマ目から隠す。
+    // 4) sticky は「今このスクロール位置で実際に貼り付いているか」で決める。
+    //    貼り付いていない sticky は通常フロー上にあり、そのコマにしか写らない。
+    //    → ページ中腹の sticky なテーブルヘッダーは、
+    //      「本来の位置に1回だけ写り、貼り付いている間は消える」という理想的な結果になる。
+    //    ただし端のコマでは「貼り付き」と「本来の位置」が一致する:
+    //    - 1コマ目（先頭）で上端に貼り付いたヘッダー … 本来の位置に「まだ」ある → 残す
+    //    - 最終コマ（末尾）で下端に貼り付いた入力欄・フッター … 本来の位置に「もう」ある → 残す
+    //    - 1コマ目で下端に貼り付いた入力欄 … 末尾から引き上げられて本文を覆っている → 隠す
+    if (info.position === 'sticky') {
+      const edge = stuckEdge(info);
+      if (edge === null) return false;
+      if (edge === 'top' && info.first) return false;
+      if (edge === 'bottom' && info.last) return false;
+      return true;
+    }
+
+    // 5) 1コマ目の fixed / オーバーレイは、上半分から始まるもの（ヘッダー類）を
+    //    本来の位置とみなして1回だけ写す。下半分のもの（バナー・チャットボタン・
+    //    入力欄）は本文を覆っているので1コマ目でも隠す。
+    if (info.first && rect.top < (regionTop + regionBottom) / 2) return false;
+
+    // 6) overlay = スクロール領域の DOM の外にあって領域に重なる要素（要素モードのみ）。
+    //    入力欄や「最下部へ」ボタンなど。スクロールしても動かず、下の本文を毎コマ隠す。
     if (info.kind === 'overlay') return true;
 
-    // 5) fixed は定義上つねにビューポートへ貼り付く＝全コマに重複して写る。
+    // 7) fixed は定義上つねにビューポートへ貼り付く＝全コマに重複して写る。
     //    全画面を覆うモーダルや Cookie バナーの暗幕もここで隠れるが、これは意図通り。
     //    隠さないと「暗幕越しのページ」が延々と続く画像になり、可読性が大きく落ちる。
     if (info.position === 'fixed') return true;
 
-    // 6) sticky は「今このスクロール位置で実際に貼り付いているか」で決める。
-    //    貼り付いていない sticky は通常フロー上にあり、そのコマにしか写らない。
-    //    → ページ中腹の sticky なテーブルヘッダーは、
-    //      「本来の位置に1回だけ写り、貼り付いている間は消える」という理想的な結果になる。
-    //    1コマ目（スクロール位置 0）で貼り付いているものは本来の位置にあるので残す。
-    if (info.position === 'sticky') return !info.first && isVerticallyStuck(info);
-
     return false;
   }
 
+  /** 撮影対象（要素 or window）が末尾までスクロールされているか */
+  function isScrolledToEnd() {
+    if (!capture) return false;
+    if (capture.el) {
+      const el = capture.el;
+      return el.scrollTop >= el.scrollHeight - el.clientHeight - 1;
+    }
+    const root = getScroller();
+    return window.scrollY >= root.scrollHeight - root.clientHeight - 1;
+  }
+
   /**
-   * sticky 要素が「縦方向に」貼り付いているかを、貼り付く辺（stickTop/Bottom）と
+   * sticky 要素が縦方向のどちらの辺に貼り付いているかを、貼り付く辺（stickTop/Bottom）と
    * inset との距離で判定する。
    * 結合は縦方向にしか行わないため、左右の sticky（固定列など）は重複しない＝対象外。
+   *
+   * @returns {'top'|'bottom'|null}
    */
-  function isVerticallyStuck(info) {
+  function stuckEdge(info) {
     const rect = info.rect;
     const vh = info.viewportHeight;
     const stickTop = info.stickTop !== undefined ? info.stickTop : 0;
     const stickBottom = info.stickBottom !== undefined ? info.stickBottom : vh;
 
     const top = resolveInset(info.top, vh);
-    if (top !== null && rect.top <= stickTop + top + 1) return true;
+    if (top !== null && rect.top <= stickTop + top + 1) return 'top';
 
     const bottom = resolveInset(info.bottom, vh);
-    if (bottom !== null && rect.bottom >= stickBottom - bottom - 1) return true;
+    if (bottom !== null && rect.bottom >= stickBottom - bottom - 1) return 'bottom';
 
-    return false;
+    return null;
   }
 
   /** `top: 12px` / `top: 10%` / `top: auto` を px 数値（または null）に正規化する */
@@ -378,9 +404,8 @@
    * hide=true は「今のスクロール位置に合わせてマスクを貼り直す」という意味で、
    * コマごとに呼ばれる。貼り付きが解除された要素はここで表示に戻る。
    *
-   * first=true（1コマ目）の扱い:
-   *   - window モード … 何も隠さない。固定ヘッダーは結合画像の先頭に1回だけ残す
-   *   - 要素モード     … オーバーレイと fixed は隠す（本文を覆っているため）。sticky は残す
+   * first=true（1コマ目）は「本来の位置にある要素は残し、下端に貼り付いて本文を
+   * 覆っているものだけ隠す」。判定は shouldHideDuringCapture 側で行う
    *
    * display:none ではなく visibility:hidden を使うのが要点。
    * sticky 要素は通常フローの領域を占めるため display:none にすると
@@ -390,13 +415,13 @@
   function toggleFixedElements(hide, first) {
     if (!hide) return restoreFixedElements();
     if (!capture) throw new Error('撮影が開始されていません');
-    if (first && !capture.el) return { ok: true, count: 0 };
 
     if (!fixedCandidates) fixedCandidates = collectFixedCandidates();
 
     // getPageMetrics と同じ要素から取る（後方互換モードで documentElement は当てにならない）
     const viewportHeight = getViewportHeight();
     const region = capture.region;
+    const last = isScrolledToEnd();
     let hiddenCount = 0;
 
     for (const record of fixedCandidates) {
@@ -407,6 +432,7 @@
       const shouldHide = shouldHideDuringCapture({
         kind: record.kind,
         first: !!first,
+        last,
         position: style.position,
         // 自分で隠した分は判定から除外する（さもないと二度と復帰できない）
         visibility: record.hidden ? 'visible' : style.visibility,
